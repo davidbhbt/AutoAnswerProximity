@@ -15,6 +15,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -35,9 +37,14 @@ class CallWatcherService : Service(), SensorEventListener {
     private var listening = false
     private var answered = false
 
-    // השהיה קצרה כדי למנוע מענה בטעות (למשל טלפון שעובר בכיס)
+    // האם החיישן דיווח "רחוק" בזמן הצלצול (כלומר הטלפון לא היה בכיס)
+    private var sawFar = false
+
     private val answerDelayMs = 700L
+    private val bluetoothDelayMs = 3000L
+
     private val answerRunnable = Runnable { answerCall() }
+    private val bluetoothRunnable = Runnable { answerCall() }
 
     private val phoneStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -78,20 +85,42 @@ class CallWatcherService : Service(), SensorEventListener {
         if (isRinging) return
         isRinging = true
         answered = false
+        sawFar = false
+
+        // מצב בלוטוס: עונים אוטומטית אחרי 3 שניות
+        val btEnabled = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_BT_AUTO, true)
+        if (btEnabled && isBluetoothAudioConnected()) {
+            handler.postDelayed(bluetoothRunnable, bluetoothDelayMs)
+        }
+
         val sensor = proximitySensor ?: run {
             Log.w(TAG, "אין חיישן קרבה במכשיר")
             return
         }
-        // רושמים את החיישן רק בזמן צלצול - חוסך סוללה
         listening = sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
     }
 
     private fun onRingingEnded() {
         isRinging = false
+        sawFar = false
         handler.removeCallbacks(answerRunnable)
+        handler.removeCallbacks(bluetoothRunnable)
         if (listening) {
             sensorManager.unregisterListener(this)
             listening = false
+        }
+    }
+
+    // ---------- בלוטוס ----------
+
+    private fun isBluetoothAudioConnected(): Boolean {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_HEARING_AID ||
+                    (Build.VERSION.SDK_INT >= 31 && it.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
         }
     }
 
@@ -103,7 +132,14 @@ class CallWatcherService : Service(), SensorEventListener {
         val near = event.values[0] < max.coerceAtMost(5f)
 
         handler.removeCallbacks(answerRunnable)
-        if (near) handler.postDelayed(answerRunnable, answerDelayMs)
+        if (!near) {
+            // הטלפון רחוק (מחוץ לכיס / ביד) - מתחילים "לחמש" את המענה
+            sawFar = true
+        } else if (sawFar) {
+            // עבר מרחוק לקרוב = הוצמד לאוזן
+            handler.postDelayed(answerRunnable, answerDelayMs)
+        }
+        // אם הוא קרוב מההתחלה (בכיס) - לא עושים כלום
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -123,6 +159,8 @@ class CallWatcherService : Service(), SensorEventListener {
             @Suppress("MissingPermission")
             telecom.acceptRingingCall()
             answered = true
+            handler.removeCallbacks(answerRunnable)
+            handler.removeCallbacks(bluetoothRunnable)
             Log.i(TAG, "השיחה נענתה")
         } catch (e: SecurityException) {
             Log.e(TAG, "נכשל במענה", e)
@@ -155,5 +193,7 @@ class CallWatcherService : Service(), SensorEventListener {
 
     companion object {
         private const val TAG = "CallWatcherService"
+        const val PREFS = "settings"
+        const val KEY_BT_AUTO = "bt_auto"
     }
 }
