@@ -1,6 +1,7 @@
 package com.example.autoanswer
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -14,6 +15,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
@@ -39,10 +41,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         val info = TextView(this).apply {
-            text = "מענה אוטומטי לשיחות כשהטלפון צמוד לאוזן.\n" +
+            text = "מענה אוטומטי לשיחות כשהטלפון מוצמד לאוזן.\n" +
                     "אחרי ההתקנה: אשרו הרשאות, והגדירו סוללה ל'ללא הגבלה'."
             textSize = 18f
             gravity = Gravity.CENTER
+        }
+
+        val prefs = getSharedPreferences(CallWatcherService.PREFS, Context.MODE_PRIVATE)
+        val btSwitch = SwitchCompat(this).apply {
+            text = "כשמחובר בלוטוס: ענה אוטומטית אחרי 3 שניות"
+            isChecked = prefs.getBoolean(CallWatcherService.KEY_BT_AUTO, true)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(CallWatcherService.KEY_BT_AUTO, checked).apply()
+            }
         }
 
         val startBtn = Button(this).apply {
@@ -67,6 +78,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         layout.addView(info)
+        layout.addView(btSwitch)
         layout.addView(startBtn)
         layout.addView(stopBtn)
         layout.addView(batteryBtn)
