@@ -40,22 +40,29 @@ class CallWatcherService : Service(), SensorEventListener {
     private var registered = false
     private var answered = false
 
+    private var gotFirstProx = false
     private var isNear = false
-    private var farSince = 0L          // מתי הטלפון הפך ל"רחוק"
-    private var lastBurstAt = 0L       // מתי הייתה תנועה חזקה לאחרונה
-    private var nearAt = 0L            // מתי הוצמד לאוזן
-    private var maxMotionSinceNear = 0f
+    private var farSince = 0L       // מתי הטלפון הפך ל"רחוק"
+    private var nearAt = 0L         // מתי הוצמד לאוזן לאחרונה
+    private var lastMotionAt = 0L   // מתי הייתה תנועה לאחרונה
+    private var armedUntil = 0L     // עד מתי "הרמה לאוזן" תקפה
 
     // ----- ערכים שאפשר לכוונן -----
-    private val minFarMs = 800L        // כמה זמן הטלפון צריך להיות רחוק לפני ההצמדה
-    private val burstThreshold = 3.0f  // עוצמת תנועה (מ/ש^2) שנחשבת "הרמה"
-    private val motionWindowMs = 2000L // התנועה חייבת לקרות עד כך זמן לפני ההצמדה
-    private val settleMs = 300L        // זמן להתייצבות אחרי ההצמדה
-    private val stillMax = 2.0f        // תנועה מקסימלית מותרת אחרי ההצמדה
-    private val answerDelayMs = 900L   // כמה זמן להישאר צמוד ויציב לפני המענה
+    private val minFarMs = 800L          // כמה זמן הטלפון צריך להיות רחוק לפני ההצמדה
+    private val motionThreshold = 2.0f   // עוצמת תנועה שנחשבת "תזוזה" (מ/ש^2)
+    private val liftWindowMs = 3000L     // התנועה חייבת להיות עד כך זמן לפני ההצמדה
+    private val armWindowMs = 5000L      // כמה זמן ההרמה נשארת תקפה אחרי ההצמדה
+    private val nearHoldMs = 500L        // כמה זמן הטלפון צריך להישאר צמוד לפני המענה
+    private val calmMs = 350L            // כמה זמן הטלפון צריך להיות יציב לפני המענה
     // --------------------------------
 
-    private val answerRunnable = Runnable { answerCall() }
+    private val checkRunnable = object : Runnable {
+        override fun run() {
+            if (!isRinging || answered) return
+            tryAnswer()
+            handler.postDelayed(this, 150L)
+        }
+    }
 
     private val phoneStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -105,29 +112,31 @@ class CallWatcherService : Service(), SensorEventListener {
         if (isRinging) return
         isRinging = true
         answered = false
+        gotFirstProx = false
         isNear = false
         farSince = 0L
-        lastBurstAt = 0L
         nearAt = 0L
-        maxMotionSinceNear = 0f
+        lastMotionAt = 0L
+        armedUntil = 0L
 
         val prox = proximitySensor ?: run {
             Log.w(TAG, "אין חיישן קרבה במכשיר")
             return
         }
-        // החיישנים פועלים רק בזמן צלצול - חוסך סוללה
         sensorManager.registerListener(this, prox, SensorManager.SENSOR_DELAY_NORMAL)
         motionSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         registered = true
+        handler.postDelayed(checkRunnable, 150L)
     }
 
     private fun onRingingEnded() {
         isRinging = false
         isNear = false
         farSince = 0L
-        handler.removeCallbacks(answerRunnable)
+        armedUntil = 0L
+        handler.removeCallbacks(checkRunnable)
         if (registered) {
             sensorManager.unregisterListener(this)
             registered = false
@@ -146,41 +155,41 @@ class CallWatcherService : Service(), SensorEventListener {
                 val y = event.values[1]
                 val z = event.values[2]
                 val magnitude = sqrt(x * x + y * y + z * z)
-                // בחיישן רגיל מפחיתים את כוח המשיכה
                 val motion = if (motionIsLinear) magnitude else abs(magnitude - SensorManager.GRAVITY_EARTH)
-
-                if (motion > burstThreshold) lastBurstAt = now
-
-                // סופרים תנועה אחרי ההצמדה (אחרי זמן התייצבות קצר)
-                if (isNear && nearAt != 0L && now - nearAt > settleMs) {
-                    if (motion > maxMotionSinceNear) maxMotionSinceNear = motion
-                }
+                if (motion > motionThreshold) lastMotionAt = now
             }
 
             Sensor.TYPE_PROXIMITY -> {
                 val max = event.sensor.maximumRange
                 val near = event.values[0] < max.coerceAtMost(5f)
+
+                // הקריאה הראשונה היא המצב ההתחלתי בזמן תחילת הצלצול
+                if (!gotFirstProx) {
+                    gotFirstProx = true
+                    isNear = near
+                    if (near) {
+                        nearAt = now          // כנראה בכיס - לא נחשב הצמדה תקפה
+                    } else {
+                        farSince = now - minFarMs   // כבר מחוץ לכיס - נחשב רחוק מספיק
+                    }
+                    return
+                }
+
                 if (near == isNear) return
                 isNear = near
-                handler.removeCallbacks(answerRunnable)
 
                 if (!near) {
-                    // הטלפון התרחק
-                    if (farSince == 0L) farSince = now
-                    nearAt = 0L
+                    farSince = now
                 } else {
-                    // הטלפון הוצמד - בודקים אם זו הרמה אמיתית לאוזן
-                    val wasFarLongEnough = farSince != 0L && (now - farSince) >= minFarMs
-                    val hadLiftMotion = lastBurstAt != 0L && (now - lastBurstAt) <= motionWindowMs
-                    farSince = 0L
-
-                    if (wasFarLongEnough && hadLiftMotion) {
-                        nearAt = now
-                        maxMotionSinceNear = 0f
-                        handler.postDelayed(answerRunnable, answerDelayMs)
+                    nearAt = now
+                    val farLongEnough = farSince != 0L && (now - farSince) >= minFarMs
+                    val hadLiftMotion = lastMotionAt != 0L && (now - lastMotionAt) <= liftWindowMs
+                    if (farLongEnough && hadLiftMotion) {
+                        armedUntil = now + armWindowMs
                     } else {
-                        Log.i(TAG, "לא נענה: רחוק=$wasFarLongEnough תנועה=$hadLiftMotion")
+                        Log.i(TAG, "הצמדה לא תקפה: רחוק=$farLongEnough תנועה=$hadLiftMotion")
                     }
+                    farSince = 0L
                 }
             }
         }
@@ -190,15 +199,16 @@ class CallWatcherService : Service(), SensorEventListener {
 
     // ---------- מענה ----------
 
+    private fun tryAnswer() {
+        val now = SystemClock.elapsedRealtime()
+        if (!isNear || now > armedUntil) return          // לא הורם לאוזן
+        if (now - nearAt < nearHoldMs) return            // עוד לא הוחזק מספיק
+        if (now - lastMotionAt < calmMs) return          // עדיין זז, מחכים שיתייצב
+        answerCall()
+    }
+
     private fun answerCall() {
-        if (!isRinging || answered || !isNear) return
-
-        // אם הטלפון המשיך לזוז אחרי ההצמדה (למשל הליכה עם טלפון בכיס) - לא עונים
-        if (maxMotionSinceNear > stillMax) {
-            Log.i(TAG, "לא נענה: תנועה אחרי ההצמדה = $maxMotionSinceNear")
-            return
-        }
-
+        if (!isRinging || answered) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ANSWER_PHONE_CALLS)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -210,7 +220,7 @@ class CallWatcherService : Service(), SensorEventListener {
             @Suppress("MissingPermission")
             telecom.acceptRingingCall()
             answered = true
-            handler.removeCallbacks(answerRunnable)
+            handler.removeCallbacks(checkRunnable)
             Log.i(TAG, "השיחה נענתה")
         } catch (e: SecurityException) {
             Log.e(TAG, "נכשל במענה", e)
